@@ -10,24 +10,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fake_useragent import UserAgent
 import os
 from dotenv import load_dotenv
-import sys
+import math
 
 load_dotenv()
 
 # ===== CONFIGURATION =====
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://odutt4440_db_user:Gaming123@cluster0.hcbkwxy.mongodb.net/?appName=Cluster0")
-DB_NAME = os.getenv("DB_NAME", "infinite_craft")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "website_recipes")  # ALAG collection! Teri existing files safe
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "30"))
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://odutt4440_db_user:Gaming123@cluster0.hcbkwxy.mongodb.net/infinite_craft_website?retryWrites=true&w=majority&appName=Cluster0")
+DB_NAME = os.getenv("DB_NAME", "infinite_craft_website")
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # Keep low to avoid rate limiting
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.5"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
 
-# ===== MongoDB Setup - ALAG COLLECTION =====
+# ===== MongoDB Setup - NAYA DB =====
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
-recipes_coll = db[COLLECTION_NAME]  # "website_recipes" collection
-elements_coll = db["website_elements"]  # "website_elements" collection
-stats_coll = db["scraping_progress"]
+recipes_coll = db["recipes"]
+elements_coll = db["elements"]
+progress_coll = db["_progress"]
 
 # Indexes
 recipes_coll.create_index([("result", 1)])
@@ -36,8 +35,8 @@ elements_coll.create_index([("name", 1)], unique=True)
 
 ua = UserAgent()
 
-# ===== BASIC 4 ELEMENTS - YAHI SE START =====
-BASIC_ELEMENTS = ["Water", "Fire", "Wind", "Earth"]
+# ===== SEED ELEMENTS =====
+SEED_ELEMENTS = ["Water", "Fire", "Wind", "Earth"]
 
 def get_headers():
     return {
@@ -46,8 +45,15 @@ def get_headers():
         "Accept-Language": "en-US,en;q=0.5",
         "DNT": "1",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     }
+
+def safe_str(val):
+    """Convert any value to string safely"""
+    if val is None:
+        return ""
+    if isinstance(val, (int, float)):
+        return str(int(val)) if val == int(val) else str(val)
+    return str(val).strip()
 
 def make_request(url, retries=5):
     """Make HTTP request with retries and rate limiting"""
@@ -59,498 +65,398 @@ def make_request(url, retries=5):
             resp = requests.get(url, headers=get_headers(), timeout=30)
             
             if resp.status_code == 429:
-                wait = (attempt + 1) * 15
+                wait = min((attempt + 1) * 20, 120)
                 print(f"  ⚠️ Rate limited! Waiting {wait}s...")
                 time.sleep(wait)
                 continue
             
             if resp.status_code == 200:
                 return resp
-            
             if resp.status_code == 404:
-                return None  # Element doesn't exist on website
+                return None
                 
             print(f"  ⚠️ Status {resp.status_code}, attempt {attempt+1}")
             
         except Exception as e:
-            print(f"  ⚠️ Request error: {e}, attempt {attempt+1}")
+            print(f"  ⚠️ Error: {e}, attempt {attempt+1}")
             time.sleep(10)
     
     return None
 
-def extract_emoji_and_name(text):
-    """Extract emoji and name - handles all edge cases"""
-    text = text.strip()
+def extract_name_parts(text):
+    """Extract (emoji, name) from text like '👨 Human' or '67' or '📱iPhone15'"""
+    text = safe_str(text)
     if not text:
-        return "", ""
+        return ("", "")
     
-    # Pattern: emoji followed by name
-    # Emojis are in Unicode ranges
-    emoji_pattern = re.compile(
-        r'([\U0001F300-\U0010FFFF\u200D\uFE0F\u00A9\u00AE\u2122\u2600-\u27BF\u2300-\u23FF'
-        r'\u25A0-\u25FF\u2B05-\u2B55\u2934\u2935\u3030\u303D\u3297\u3299'
-        r'\U0001F000-\U0001FFFF\u20E3\u20E0\u0023\u002A\u0030-\u0039\uFE0F]*)'
-    )
+    # Try to match emoji at start
+    # This pattern covers most emojis including skin tones, flags, etc.
+    emoji_match = re.match(r'([\U0001F000-\U0010FFFF\u00A9\u00AE\u2122\u2600-\u27BF\u2300-\u23FF\u25A0-\u25FF\u2B05-\u2B55\u2934\u2935\u3030\u303D\u3297\u3299\u200D\uFE0F\u20E3]+)\s*(.*)', text)
     
-    match = emoji_pattern.match(text)
-    emoji = match.group(1) if match else ""
-    name = text[len(emoji):].strip()
+    if emoji_match and emoji_match.group(1):
+        emoji = emoji_match.group(1).strip()
+        name = emoji_match.group(2).strip()
+        if not name:
+            name = text
+        return (emoji, name)
     
-    if not name:
-        name = text
-    
-    return emoji, name
+    # No emoji found, return full text as name
+    return ("", text)
 
-def scrape_element_page(element_name):
-    """Scrape a single element's recipe page - complete with ALL recipes"""
-    if not element_name or not isinstance(element_name, str):
-        print(f"  ⚠️ Invalid element name: {element_name}")
-        return None
-    
-    element_name = element_name.strip()
+def scrape_element(element_name):
+    """Scrape a single element's recipe page"""
+    element_name = safe_str(element_name)
     if not element_name:
         return None
     
     url_name = element_name.replace(' ', '-')
     url = f"https://infinitecraftrecipe.com/recipes/{quote(url_name)}"
     
-    print(f"  🔍 Scraping: {element_name}")
+    print(f"  🔍 [{element_name}]", end=" ", flush=True)
     
     resp = make_request(url)
     if not resp:
-        print(f"  ❌ Failed/Not found: {element_name}")
+        print("❌")
         return None
     
     soup = BeautifulSoup(resp.text, 'lxml')
-    recipes = []
+    recipes_found = []
     
-    # === METHOD 1: __NEXT_DATA__ (if available) ===
-    script_tag = soup.find('script', id='__NEXT_DATA__')
-    if script_tag:
+    # ---- METHOD 1: Look for __NEXT_DATA__ ----
+    script = soup.find('script', id='__NEXT_DATA__')
+    if script:
         try:
-            next_data = json.loads(script_tag.string)
-            if 'props' in next_data and 'pageProps' in next_data['props']:
-                props = next_data['props']['pageProps']
-                if 'recipes' in props and isinstance(props['recipes'], list):
-                    for r in props['recipes']:
-                        f_emoji, f_name = extract_emoji_and_name(r.get('first', ''))
-                        s_emoji, s_name = extract_emoji_and_name(r.get('second', ''))
-                        r_emoji, r_name = extract_emoji_and_name(r.get('result', ''))
-                        if f_name and s_name and r_name:
-                            recipes.append({
-                                "first": f_name,
-                                "first_emoji": f_emoji or r.get('firstEmoji', ''),
-                                "second": s_name,
-                                "second_emoji": s_emoji or r.get('secondEmoji', ''),
-                                "result": r_name,
-                                "result_emoji": r_emoji or r.get('resultEmoji', ''),
+            nd = json.loads(script.string)
+            props = nd.get('props', {}).get('pageProps', {})
+            
+            # Check for recipe list
+            if 'recipes' in props and isinstance(props['recipes'], list):
+                for r in props['recipes']:
+                    if isinstance(r, dict):
+                        first_emoji, first_name = extract_name_parts(r.get('first', ''))
+                        second_emoji, second_name = extract_name_parts(r.get('second', ''))
+                        result_emoji, result_name = extract_name_parts(r.get('result', ''))
+                        
+                        if first_name and second_name and result_name:
+                            recipes_found.append({
+                                "first": first_name,
+                                "first_emoji": first_emoji or safe_str(r.get('firstEmoji', '')),
+                                "second": second_name,
+                                "second_emoji": second_emoji or safe_str(r.get('secondEmoji', '')),
+                                "result": result_name,
+                                "result_emoji": result_emoji or safe_str(r.get('resultEmoji', '')),
                             })
         except:
             pass
     
-    # === METHOD 2: HTML Tables ===
-    if not recipes:
-        # Find all recipe tables
-        for table in soup.find_all('table'):
-            for row in table.find_all('tr'):
-                cells = row.find_all(['td', 'th'])
-                # Remove empty cells
-                cells = [c for c in cells if c.get_text(strip=True)]
+    # ---- METHOD 2: Parse HTML tables ----
+    if not recipes_found:
+        tables = soup.find_all('table')
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows:
+                row_text = row.get_text(strip=True)
+                if not row_text:
+                    continue
                 
-                if len(cells) >= 3:
-                    row_text = row.get_text(strip=True)
+                # Split by + and =
+                parts = re.split(r'\s*\+\s*|\s*=\s*', row_text)
+                parts = [p.strip() for p in parts if p.strip()]
+                
+                if len(parts) >= 3:
+                    first_emoji, first_name = extract_name_parts(parts[0])
+                    second_emoji, second_name = extract_name_parts(parts[1])
+                    result_emoji, result_name = extract_name_parts(parts[-1])
                     
-                    # Try various separator patterns
-                    for sep_pattern in [r'\s*\+\s*', r'\s*=\s*']:
-                        parts = re.split(sep_pattern, row_text)
-                        if len(parts) >= 3:
-                            first_part = parts[0].strip()
-                            second_part = parts[1].strip()
-                            result_part = parts[-1].strip()
-                            
-                            f_emoji, f_name = extract_emoji_and_name(first_part)
-                            s_emoji, s_name = extract_emoji_and_name(second_part)
-                            r_emoji, r_name = extract_emoji_and_name(result_part)
-                            
-                            if f_name and s_name and r_name:
-                                recipes.append({
-                                    "first": f_name,
-                                    "first_emoji": f_emoji,
-                                    "second": s_name,
-                                    "second_emoji": s_emoji,
-                                    "result": r_name,
-                                    "result_emoji": r_emoji,
-                                })
-                            break  # Found valid split
+                    if first_name and second_name and result_name:
+                        recipes_found.append({
+                            "first": first_name,
+                            "first_emoji": first_emoji,
+                            "second": second_name,
+                            "second_emoji": second_emoji,
+                            "result": result_name,
+                            "result_emoji": result_emoji,
+                        })
     
-    # === METHOD 3: Link-based recipes (common in this website) ===
-    if not recipes:
-        # Look for recipe pattern in links
-        for link in soup.find_all('a', href=True):
-            link_text = link.get_text(strip=True)
-            href = link['href']
-            
-            # Check if this is part of a recipe row
+    # ---- METHOD 3: Parse from links (the website uses this pattern heavily) ----
+    if not recipes_found:
+        links = soup.find_all('a')
+        for link in links:
             parent = link.parent
-            if parent:
-                parent_text = parent.get_text(strip=True)
-                if '+' in parent_text and '=' in parent_text:
-                    # Parse the full parent text
-                    parts = re.split(r'\s*[+=]\s*', parent_text)
-                    if len(parts) >= 3:
-                        # Find which part is our link
-                        for i, part in enumerate(parts):
-                            if link_text in part:
-                                if i == 0:
-                                    # This is first ingredient
-                                    f_emoji, f_name = extract_emoji_and_name(part)
-                                    s_part = parts[1].strip()
-                                    r_part = parts[-1].strip()
-                                    s_emoji, s_name = extract_emoji_and_name(s_part)
-                                    r_emoji, r_name = extract_emoji_and_name(r_part)
-                                elif i == 1:
-                                    # This is second ingredient
-                                    f_part = parts[0].strip()
-                                    f_emoji, f_name = extract_emoji_and_name(f_part)
-                                    s_emoji, s_name = extract_emoji_and_name(part)
-                                    r_part = parts[-1].strip()
-                                    r_emoji, r_name = extract_emoji_and_name(r_part)
-                                else:
-                                    # This is result
-                                    f_part = parts[0].strip()
-                                    f_emoji, f_name = extract_emoji_and_name(f_part)
-                                    s_part = parts[1].strip()
-                                    s_emoji, s_name = extract_emoji_and_name(s_part)
-                                    r_emoji, r_name = extract_emoji_and_name(part)
-                                
-                                if f_name and s_name and r_name:
-                                    recipes.append({
-                                        "first": f_name,
-                                        "first_emoji": f_emoji,
-                                        "second": s_name,
-                                        "second_emoji": s_emoji,
-                                        "result": r_name,
-                                        "result_emoji": r_emoji,
-                                    })
-                                break
+            if not parent:
+                continue
+            
+            parent_text = parent.get_text(strip=True)
+            if '+' in parent_text and '=' in parent_text:
+                parts = re.split(r'\s*\+\s*|\s*=\s*', parent_text)
+                parts = [p.strip() for p in parts if p.strip()]
+                
+                if len(parts) >= 3:
+                    first_emoji, first_name = extract_name_parts(parts[0])
+                    second_emoji, second_name = extract_name_parts(parts[1])
+                    result_emoji, result_name = extract_name_parts(parts[-1])
+                    
+                    if first_name and second_name and result_name:
+                        recipes_found.append({
+                            "first": first_name,
+                            "first_emoji": first_emoji,
+                            "second": second_name,
+                            "second_emoji": second_emoji,
+                            "result": result_name,
+                            "result_emoji": result_emoji,
+                        })
     
-    # === METHOD 4: Inline JavaScript ===
-    if not recipes:
+    # ---- METHOD 4: Look for JSON in any script tag ----
+    if not recipes_found:
         for script in soup.find_all('script'):
-            if script.string:
-                # Look for various data patterns
-                for pattern in [
-                    r'recipes\s*=\s*(\[.*?\])\s*;',
-                    r'const\s+recipes\s*=\s*(\[.*?\])\s*;',
-                    r'var\s+recipes\s*=\s*(\[.*?\])\s*;',
-                    r'"recipes":\s*(\[.*?\])',
-                ]:
-                    match = re.search(pattern, script.string, re.DOTALL)
-                    if match:
-                        try:
-                            data = json.loads(match.group(1))
-                            if isinstance(data, list):
-                                for item in data:
-                                    if isinstance(item, dict):
-                                        first = item.get('first', item.get('a', ''))
-                                        second = item.get('second', item.get('b', ''))
-                                        result = item.get('result', item.get('c', ''))
-                                        if isinstance(first, (int, float)):
-                                            first = str(first)
-                                        if isinstance(second, (int, float)):
-                                            second = str(second)
-                                        if isinstance(result, (int, float)):
-                                            result = str(result)
-                                        
-                                        f_emoji, f_name = extract_emoji_and_name(first)
-                                        s_emoji, s_name = extract_emoji_and_name(second)
-                                        r_emoji, r_name = extract_emoji_and_name(result)
-                                        
-                                        if f_name and s_name and r_name:
-                                            recipes.append({
-                                                "first": f_name,
-                                                "first_emoji": f_emoji or item.get('firstEmoji', item.get('first_emoji', '')),
-                                                "second": s_name,
-                                                "second_emoji": s_emoji or item.get('secondEmoji', item.get('second_emoji', '')),
-                                                "result": r_name,
-                                                "result_emoji": r_emoji or item.get('resultEmoji', item.get('result_emoji', '')),
-                                            })
-                        except:
-                            pass
+            if not script.string:
+                continue
+            content = script.string
+            
+            # Try various JSON pattern
+            for pattern in [
+                r'"recipes"\s*:\s*(\[[^\]]+\])',
+                r'recipes\s*=\s*(\[[^\]]+\])',
+                r'"recipeData"\s*:\s*(\[[^\]]+\])',
+            ]:
+                match = re.search(pattern, content, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict):
+                                    first = safe_str(item.get('first', item.get('a', '')))
+                                    second = safe_str(item.get('second', item.get('b', '')))
+                                    result = safe_str(item.get('result', item.get('c', '')))
+                                    
+                                    if first and second and result:
+                                        recipes_found.append({
+                                            "first": first,
+                                            "first_emoji": safe_str(item.get('firstEmoji', item.get('first_emoji', ''))),
+                                            "second": second,
+                                            "second_emoji": safe_str(item.get('secondEmoji', item.get('second_emoji', ''))),
+                                            "result": result,
+                                            "result_emoji": safe_str(item.get('resultEmoji', item.get('result_emoji', ''))),
+                                        })
+                    except:
+                        pass
     
-    # === METHOD 5: Data attributes ===
-    if not recipes:
-        for elem in soup.find_all(True):
-            data_recipe = elem.get('data-recipe') or elem.get('data-recipes')
-            if data_recipe:
-                try:
-                    data = json.loads(data_recipe) if isinstance(data_recipe, str) else data_recipe
-                    if isinstance(data, list):
-                        for item in data:
-                            if isinstance(item, dict) and 'result' in item:
-                                f_emoji, f_name = extract_emoji_and_name(str(item.get('first', '')))
-                                s_emoji, s_name = extract_emoji_and_name(str(item.get('second', '')))
-                                r_emoji, r_name = extract_emoji_and_name(str(item.get('result', '')))
-                                if f_name and s_name and r_name:
-                                    recipes.append({
-                                        "first": f_name,
-                                        "first_emoji": f_emoji,
-                                        "second": s_name,
-                                        "second_emoji": s_emoji,
-                                        "result": r_name,
-                                        "result_emoji": r_emoji,
-                                    })
-                except:
-                    pass
-    
-    # Deduplicate recipes
+    # Deduplicate
     seen = set()
-    unique_recipes = []
-    for r in recipes:
-        key = (r['first'], r['second'], r['result'])
+    unique = []
+    for r in recipes_found:
+        key = (r['first'].lower(), r['second'].lower(), r['result'].lower())
         if key not in seen:
             seen.add(key)
-            unique_recipes.append(r)
+            unique.append(r)
     
-    # Extract element info
-    element_emoji = ""
-    element_name_clean = element_name
+    # Extract element info from page
+    element_emoji, element_name = extract_name_parts(element_name)
     
-    # From H1
+    # Try to get proper emoji from H1
     h1 = soup.find('h1')
     if h1:
         h1_text = h1.get_text(strip=True)
-        match = re.match(r'How to make (.+) in Infinite Craft', h1_text)
-        if match:
-            combined = match.group(1).strip()
-            e_emoji, e_name = extract_emoji_and_name(combined)
-            if e_name:
-                element_emoji = e_emoji
-                element_name_clean = e_name
+        m = re.match(r'How to make (.+?) (.+) in Infinite Craft', h1_text)
+        if m:
+            element_emoji = m.group(1)
+            element_name = m.group(2)
     
-    # From title as fallback
-    if not element_emoji:
-        title_tag = soup.find('title')
-        if title_tag:
-            title_text = title_tag.get_text()
-            match = re.match(r'How to make (.+) in Infinite Craft', title_text)
-            if match:
-                combined = match.group(1).strip()
-                e_emoji, e_name = extract_emoji_and_name(combined)
-                if e_name:
-                    element_emoji = e_emoji
-                    element_name_clean = e_name
-    
-    if unique_recipes:
-        print(f"  ✅ {element_name}: {len(unique_recipes)} recipes, emoji: '{element_emoji}'")
+    if unique:
+        print(f"✅ {len(unique)} recipes")
+    else:
+        print("⚠️ No recipes found")
     
     return {
         "element": {
             "emoji": element_emoji,
-            "name": element_name_clean,
-            "url": url
+            "name": element_name or element_name,
         },
-        "recipes": unique_recipes
+        "recipes": unique,
+        "total": len(unique)
     }
 
-def save_to_mongodb(data):
-    """Save data to MongoDB"""
+def save_results(data):
+    """Save to MongoDB and return newly discovered element names"""
     if not data:
         return set()
     
     new_names = set()
     
     # Save element
-    if data.get('element'):
+    if data.get('element') and data['element'].get('name'):
         try:
             elements_coll.update_one(
                 {"name": data['element']['name']},
-                {"$set": data['element']},
+                {"$set": {
+                    "name": data['element']['name'],
+                    "emoji": data['element'].get('emoji', ''),
+                    "last_scraped": time.time()
+                }},
                 upsert=True
             )
         except Exception as e:
-            print(f"  ⚠️ Error saving element: {e}")
+            print(f"    ⚠️ Element save error: {e}")
     
-    # Save recipes
-    for recipe in data.get('recipes', []):
+    # Save recipes and collect new names
+    for r in data.get('recipes', []):
         try:
-            new_names.add(recipe['first'])
-            new_names.add(recipe['second'])
-            new_names.add(recipe['result'])
+            new_names.add(r['first'])
+            new_names.add(r['second'])
+            new_names.add(r['result'])
             
             recipes_coll.update_one(
-                {
-                    "first": recipe['first'],
-                    "second": recipe['second'],
-                    "result": recipe['result']
-                },
-                {"$set": recipe},
+                {"first": r['first'], "second": r['second'], "result": r['result']},
+                {"$set": r},
                 upsert=True
             )
         except Exception as e:
-            print(f"  ⚠️ Error saving recipe: {e}")
+            pass
     
     return new_names
 
-def get_pending_elements(scraped_set):
-    """Get elements that exist in DB but haven't been scraped yet"""
-    all_elements = set()
+def get_known_elements():
+    """Get all known element names from DB"""
+    names = set()
     
-    # Elements collection se
-    for elem in elements_coll.find({}, {"name": 1}):
-        all_elements.add(elem['name'])
+    for doc in elements_coll.find({}, {"name": 1}):
+        if doc.get('name'):
+            names.add(doc['name'])
     
-    # Recipes collection se (first, second, result)
     pipeline = [
         {"$group": {
             "_id": None,
-            "firsts": {"$addToSet": "$first"},
-            "seconds": {"$addToSet": "$second"},
-            "results": {"$addToSet": "$result"}
+            "all": {"$addToSet": "$first"},
+            "all2": {"$addToSet": "$second"},
+            "all3": {"$addToSet": "$result"}
         }}
     ]
     result = list(recipes_coll.aggregate(pipeline))
     if result:
-        for key in ['firsts', 'seconds', 'results']:
+        for key in ['all', 'all2', 'all3']:
             for name in result[0].get(key, []):
                 if isinstance(name, str) and name.strip():
-                    all_elements.add(name.strip())
+                    names.add(name.strip())
     
-    # Remove already scraped
-    pending = [e for e in all_elements if e not in scraped_set]
-    pending.sort()
-    return pending
+    return names
 
-def load_progress():
-    """Load scraping progress from MongoDB"""
-    doc = stats_coll.find_one({"_id": "progress"})
+def get_scraped_set():
+    """Get set of already scraped element names"""
+    doc = progress_coll.find_one({"_id": "scraped"})
     if doc:
-        scraped = set(doc.get("scraped_elements", []))
-        return scraped
+        return set(doc.get("names", []))
     return set()
 
-def save_progress(scraped_set):
-    """Save scraping progress"""
-    stats_coll.update_one(
-        {"_id": "progress"},
-        {"$set": {"scraped_elements": list(scraped_set), "last_updated": time.time()}},
+def save_scraped_set(scraped):
+    progress_coll.update_one(
+        {"_id": "scraped"},
+        {"$set": {"names": list(scraped), "count": len(scraped), "updated": time.time()}},
         upsert=True
     )
 
 def main():
     print("=" * 60)
-    print("🔬 INFINITE CRAFT RECIPE SCRAPER v2")
+    print("🔬 INFINITE CRAFT WEBSITE SCRAPER")
+    print(f"📁 DB: {DB_NAME}")
     print("=" * 60)
     
-    # Load progress
-    scraped_elements = load_progress()
+    scraped = get_scraped_set()
     
-    print(f"\n📊 Current DB state:")
-    print(f"   Elements: {elements_coll.count_documents({})}")
-    print(f"   Recipes: {recipes_coll.count_documents({})}")
-    print(f"   Already scraped: {len(scraped_elements)} elements")
+    print(f"\n📊 Status:")
+    print(f"   Elements in DB: {elements_coll.count_documents({})}")
+    print(f"   Recipes in DB: {recipes_coll.count_documents({})}")
+    print(f"   Already scraped pages: {len(scraped)}")
     
-    # Phase 1: Seed with BASIC elements
-    print("\n📥 PHASE 1: Seeding with basic elements...")
-    basic_to_scrape = [e for e in BASIC_ELEMENTS if e not in scraped_elements]
+    # PHASE 1: Seed with basics
+    print("\n📥 PHASE 1: Seeding...")
+    queue = [e for e in SEED_ELEMENTS if e not in scraped]
     
-    if basic_to_scrape:
-        print(f"   Scraping {len(basic_to_scrape)} basic elements first...")
-        for elem in basic_to_scrape:
-            data = scrape_element_page(elem)
-            if data:
-                new_names = save_to_mongodb(data)
-                scraped_elements.add(elem)
-                for n in new_names:
-                    if isinstance(n, str) and n.strip():
-                        scraped_elements.add(n.strip())
-                save_progress(scraped_elements)
-                print(f"   ✅ Saved + discovered {len(new_names)} new names")
+    for elem in queue:
+        data = scrape_element(elem)
+        if data:
+            new_names = save_results(data)
+            scraped.add(elem)
+            scraped.update(n for n in new_names if isinstance(n, str))
+            save_scraped_set(scraped)
     
-    # Phase 2: Discovery loop
-    print("\n🔍 PHASE 2: Starting discovery loop...")
+    # PHASE 2: Discovery loop
+    print("\n🔁 PHASE 2: Discovery loop")
     iteration = 0
-    last_new_count = 0
-    stale_iterations = 0
+    no_progress_count = 0
     
     while True:
         iteration += 1
-        pending = get_pending_elements(scraped_elements)
+        known = get_known_elements()
+        pending = [e for e in known if e not in scraped]
         
         if not pending:
-            print("\n✅ No more elements to scrape!")
+            print("\n✅ All known elements scraped!")
             break
         
-        # Check if we're making progress
-        if len(pending) == last_new_count:
-            stale_iterations += 1
-        else:
-            stale_iterations = 0
-        last_new_count = len(pending)
-        
-        if stale_iterations >= 5:
-            print("\n⚠️ No new discoveries for 5 iterations. Trying broader approach...")
-            # Try scraping all known elements regardless
-            pending = list(elements_coll.find({}, {"name": 1}))
-            pending = [e['name'] for e in pending if e['name'] not in scraped_elements][:100]
-            if not pending:
-                break
-        
         print(f"\n{'='*40}")
-        print(f"📦 Iteration {iteration} - {len(pending)} pending elements")
+        print(f"📦 Iteration {iteration}: {len(pending)} pending")
         print(f"{'='*40}")
         
         batch = pending[:BATCH_SIZE]
         batch_data = []
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(scrape_element_page, elem): elem for elem in batch}
+            futures = {}
+            for elem in batch:
+                futures[executor.submit(scrape_element, elem)] = elem
             
             for future in as_completed(futures):
                 try:
                     data = future.result()
                     if data:
                         batch_data.append(data)
-                        scraped_elements.add(data['element']['name'])
+                        scraped.add(data['element']['name'])
                 except Exception as e:
-                    print(f"  ⚠️ Thread error: {e}")
+                    print(f"    ⚠️ Thread error: {e}")
         
-        # Save batch
+        # Save everything
+        total_new = set()
         for data in batch_data:
-            new_names = save_to_mongodb(data)
-            for n in new_names:
-                if isinstance(n, str) and n.strip():
-                    scraped_elements.add(n.strip())
+            new_names = save_results(data)
+            total_new.update(new_names)
         
-        # Save progress
-        save_progress(scraped_elements)
+        # Update scraped set
+        for data in batch_data:
+            scraped.add(data['element']['name'])
+        scraped.update(n for n in total_new if isinstance(n, str))
+        save_scraped_set(scraped)
         
         # Stats
-        total_recipes = recipes_coll.count_documents({})
-        total_elems = elements_coll.count_documents({})
-        print(f"\n📊 Progress: {len(scraped_elements)} scraped | {total_recipes} recipes | {total_elems} elements")
+        print(f"\n📊 Progress: {len(scraped)} scraped | {recipes_coll.count_documents({})} recipes | {elements_coll.count_documents({})} elements")
         
-        # Every 10 iterations, show sample
-        if iteration % 10 == 0:
-            print("\n🔍 Sample recipes:")
+        if len(pending) == len([e for e in get_known_elements() if e not in scraped]):
+            no_progress_count += 1
+        else:
+            no_progress_count = 0
+        
+        if no_progress_count >= 10:
+            print("\n⚠️ No new elements discovered. Checking all known elements...")
+            all_known = get_known_elements()
+            pending = [e for e in all_known if e not in scraped][:50]
+            if not pending:
+                break
+            no_progress_count = 0
+        
+        if iteration % 5 == 0:
+            print("\n📋 Sample:")
             sample = list(recipes_coll.aggregate([{"$sample": {"size": 3}}]))
             for s in sample:
                 print(f"   {s.get('first_emoji','')}{s.get('first','')} + {s.get('second_emoji','')}{s.get('second','')} = {s.get('result_emoji','')}{s.get('result','')}")
     
-    # Final
+    # Done
     print("\n" + "=" * 60)
-    print("🎉 SCRAPING COMPLETE!")
+    print("🎉 COMPLETE!")
     print("=" * 60)
-    print(f"\n📊 Final Statistics:")
-    print(f"   Elements in DB: {elements_coll.count_documents({})}")
-    print(f"   Recipes in DB: {recipes_coll.count_documents({})}")
-    
-    print("\n🔍 Sample recipes:")
-    sample = list(recipes_coll.aggregate([{"$sample": {"size": 10}}]))
-    for s in sample:
-        print(f"   {s.get('first_emoji','')}{s.get('first','')} + {s.get('second_emoji','')}{s.get('second','')} = {s.get('result_emoji','')}{s.get('result','')}")
-    
-    print(f"\n✅ Data in collection '{COLLECTION_NAME}' - teri existing files safe!")
+    print(f"\n📊 Final:")
+    print(f"   Elements: {elements_coll.count_documents({})}")
+    print(f"   Recipes: {recipes_coll.count_documents({})}")
+    print(f"   Pages scraped: {len(scraped)}")
 
 if __name__ == "__main__":
     main()
