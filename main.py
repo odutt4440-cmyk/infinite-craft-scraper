@@ -237,11 +237,17 @@ def main():
         
         print("📥 Loading elements from DB...", flush=True)
         elem_list = []
+        raw_names = set()
         
-        # ===== FIX: Use distinct() instead of aggregation/find =====
-        # Yeh sabse fast aur memory-efficient hai
-        raw_names = list(elements_coll.distinct("name"))
-        print(f"   ✅ {len(raw_names)} distinct names loaded", flush=True)
+        # ===== FIX: Simple cursor with batch_size (no timeout issues) =====
+        cursor = elements_coll.find({}, {"name": 1}).batch_size(5000)
+        for doc in cursor:
+            name = doc.get("name", "")
+            if name:
+                raw_names.add(name)
+        cursor.close()
+        
+        print(f"   ✅ {len(raw_names)} names loaded", flush=True)
         
         # Clean names
         for name in raw_names:
@@ -341,6 +347,3 @@ def main():
     print("🎉 COMPLETE!", flush=True)
     print(f"   Elements: {elements_coll.count_documents({})}", flush=True)
     print(f"   Recipes: {recipes_coll.count_documents({})}", flush=True)
-
-if __name__ == "__main__":
-    main()
