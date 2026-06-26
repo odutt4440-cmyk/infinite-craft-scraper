@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fake_useragent import UserAgent
 import os
 import sys
-import json  # NEW
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,8 +17,8 @@ load_dotenv()
 # ===== CONFIG =====
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://odutt4440_db_user:Gaming123@cluster0.hcbkwxy.mongodb.net/?appName=Cluster0")
 DB_NAME = os.getenv("DB_NAME", "infinite_craft")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))  # FIXED: 30 -> 5 (rate limit avoid)
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))   # FIXED: 100 -> 20 (slow and steady)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -48,7 +48,7 @@ def get_headers():
 def fetch(url, retries=5):
     for a in range(retries):
         try:
-            time.sleep(1.5 + random.uniform(0, 1.5))  # FIXED: increased delay
+            time.sleep(1.5 + random.uniform(0, 1.5))
             r = requests.get(url, headers=get_headers(), timeout=30)
             if r.status_code == 200: return r
             if r.status_code == 429:
@@ -214,8 +214,6 @@ def save(data):
 def load_progress():
     d = progress_coll.find_one({"_id": "p"})
     s = set(d.get("e", [])) if d else set()
-    # ===== FIX: NO cursor iteration over 7L docs =====
-    # Sirf progress doc se load karo, recipes_coll se nahi
     return s
 
 def save_progress(s):
@@ -235,17 +233,36 @@ def main():
     if existing_elements > 100:
         print(f"✅ Direct Phase 3: Scraping recipes...", flush=True)
         
-        print("📥 Loading elements from DB...", flush=True)
+        print("📥 Loading elements from DB in pages...", flush=True)
         elem_list = []
         raw_names = set()
         
-        # ===== FIX: Simple cursor with batch_size (no timeout issues) =====
-        cursor = elements_coll.find({}, {"name": 1}).batch_size(5000)
-        for doc in cursor:
-            name = doc.get("name", "")
-            if name:
-                raw_names.add(name)
-        cursor.close()
+        # ===== FINAL FIX: Paginated fetch, NOT cursor =====
+        page_size = 20000
+        last_id = None
+        total = 0
+        
+        while True:
+            if last_id is None:
+                docs = list(elements_coll.find({}, {"name": 1, "_id": 1})
+                            .sort("_id", 1)
+                            .limit(page_size))
+            else:
+                docs = list(elements_coll.find({"_id": {"$gt": last_id}}, {"name": 1, "_id": 1})
+                            .sort("_id", 1)
+                            .limit(page_size))
+            
+            if not docs:
+                break
+            
+            for doc in docs:
+                name = doc.get("name", "")
+                if name:
+                    raw_names.add(name)
+                last_id = doc["_id"]
+            
+            total += len(docs)
+            print(f"   ... {total} loaded", flush=True)
         
         print(f"   ✅ {len(raw_names)} names loaded", flush=True)
         
@@ -347,3 +364,6 @@ def main():
     print("🎉 COMPLETE!", flush=True)
     print(f"   Elements: {elements_coll.count_documents({})}", flush=True)
     print(f"   Recipes: {recipes_coll.count_documents({})}", flush=True)
+
+if __name__ == "__main__":
+    main()
