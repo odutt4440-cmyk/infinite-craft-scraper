@@ -1,4 +1,4 @@
-# final_scraper.py
+# final_clean_scraper.py
 import requests
 import json
 from pymongo import MongoClient, UpdateOne
@@ -16,94 +16,132 @@ db = client[DB_NAME]
 recipes_coll = db["website_recipes"]
 elements_coll = db["website_elements"]
 
-# Pehle saare indexes drop karo jo conflict kar sakte hain
-for index_name in ["first_1_second_1", "result_1"]:
-    try:
-        recipes_coll.drop_index(index_name)
-    except:
-        pass
-
-# Ab naye indexes banao (unique nahi, simple indexes)
-recipes_coll.create_index([("first", 1), ("second", 1)])
-elements_coll.create_index([("name", 1)], unique=True)
-
 DATA_URL = "https://github.com/expitau/InfiniteCraftWiki/raw/refs/heads/main/web/data/data.json"
 
-def main():
-    print("="*60)
-    print("🔥 FINAL SCRAPER - NO INDEX CONFLICT")
-    print("="*60)
+def clean_db():
+    """Pehle saare duplicates hatao aur fresh indexes banao"""
+    print("🧹 Cleaning database...")
     
-    start = time.time()
+    # 1. Drop both collections
+    recipes_coll.drop()
+    elements_coll.drop()
+    print("   ✅ Dropped old collections")
     
-    # Step 1: Download
-    print("\n📥 Downloading data.json...")
+    # 2. Fresh indexes
+    elements_coll.create_index([("name", 1)], unique=True)
+    elements_coll.create_index([("code", 1)], unique=True)
+    recipes_coll.create_index([("first", 1), ("second", 1)])
+    recipes_coll.create_index([("result", 1)])
+    print("   ✅ Fresh indexes created")
+
+def download_data():
+    """Download data.json"""
+    print("📥 Downloading data.json...")
     resp = requests.get(DATA_URL, timeout=300)
     if resp.status_code != 200:
         print(f"❌ Failed: {resp.status_code}")
-        return
+        return None, None
     
     data = resp.json()
     index = data.get("index", {})
     data_str = data.get("data", "")
     
-    print(f"✅ Elements: {len(index)}")
-    print(f"✅ Recipes in string: {len(data_str.split(';'))}")
-    
-    # Step 2: Elements insert karo
+    print(f"   ✅ {len(index)} elements")
+    print(f"   ✅ {len(data_str.split(';'))} recipes")
+    return index, data_str
+
+def insert_elements(index):
+    """Bulk insert elements - NO duplicates"""
     print("\n📦 Inserting elements...")
-    elem_ops = []
+    
+    batch = []
+    count = 0
+    
     for code, elem in index.items():
-        elem_ops.append(
+        emoji = elem[0]
+        name = elem[1]
+        cost = elem[2] if len(elem) > 2 else 0
+        
+        # Ordered=False means continue on error (skip duplicates silently)
+        batch.append(
             UpdateOne(
-                {"name": elem[1]},
+                {"name": name},
                 {"$set": {
                     "code": code,
-                    "name": elem[1],
-                    "emoji": elem[0],
-                    "cost": elem[2] if len(elem) > 2 else 0
+                    "name": name,
+                    "emoji": emoji,
+                    "cost": cost
                 }},
                 upsert=True
             )
         )
-        if len(elem_ops) >= 5000:
-            elements_coll.bulk_write(elem_ops, ordered=False)
-            elem_ops = []
+        count += 1
+        
+        if len(batch) >= 10000:
+            try:
+                elements_coll.bulk_write(batch, ordered=False)
+            except:
+                # Agar koi error aaye toh ek-ek karke try karo
+                for op in batch:
+                    try:
+                        elements_coll.bulk_write([op], ordered=False)
+                    except:
+                        pass
+            batch = []
+            print(f"   ✅ {count} elements...")
     
-    if elem_ops:
-        elements_coll.bulk_write(elem_ops, ordered=False)
-    print(f"✅ {len(index)} elements done!")
+    if batch:
+        try:
+            elements_coll.bulk_write(batch, ordered=False)
+        except:
+            for op in batch:
+                try:
+                    elements_coll.bulk_write([op], ordered=False)
+                except:
+                    pass
     
-    # Step 3: Recipes insert karo
+    print(f"   ✅ Total: {elements_coll.count_documents({})} elements")
+
+def insert_recipes(index, data_str):
+    """Bulk insert recipes - FAST"""
     print("\n📦 Inserting recipes...")
+    
     recipes = data_str.split(";")
+    total = len(recipes)
     batch = []
     count = 0
+    errors = 0
+    start = time.time()
     
-    for recipe_str in recipes:
+    for i, recipe_str in enumerate(recipes):
         if not recipe_str.strip():
             continue
         
         parts = recipe_str.split(",")
         if len(parts) != 3:
+            errors += 1
             continue
         
         code_a, code_b, code_r = parts
         
         a = index.get(code_a)
-        b = index.get(code_b) 
+        b = index.get(code_b)
         r = index.get(code_r)
         
         if not a or not b or not r:
+            errors += 1
             continue
         
         batch.append(
             UpdateOne(
                 {"first": a[1], "second": b[1]},
                 {"$set": {
-                    "first": a[1], "first_emoji": a[0],
-                    "second": b[1], "second_emoji": b[0],
-                    "result": r[1], "result_emoji": r[0]
+                    "first": a[1],
+                    "first_emoji": a[0],
+                    "second": b[1],
+                    "second_emoji": b[0],
+                    "result": r[1],
+                    "result_emoji": r[0]
                 }},
                 upsert=True
             )
@@ -113,18 +151,52 @@ def main():
         if len(batch) >= 10000:
             recipes_coll.bulk_write(batch, ordered=False)
             batch = []
+            
             elapsed = time.time() - start
-            print(f"   ✅ {count} recipes... ({count/(elapsed/60):.0f}/min)")
+            rate = count / (elapsed / 60) if elapsed > 0 else 0
+            pct = (i / total) * 100
+            eta = (total - i) / (rate / 60) if rate > 0 else 0
+            
+            print(f"   ✅ {count} recipes ({pct:.0f}%) | {rate:.0f}/min | ETA: {eta:.0f} min")
     
     if batch:
         recipes_coll.bulk_write(batch, ordered=False)
     
     elapsed = time.time() - start
+    print(f"\n   ✅ DONE! {count} recipes in {elapsed:.0f}s ({elapsed/60:.1f} min)")
+    print(f"   ⚠️ Errors: {errors}")
+
+def main():
+    print("="*60)
+    print("🔥 FINAL SCRAPER - NO DUPLICATES")
+    print("="*60)
+    
+    overall_start = time.time()
+    
+    # Step 0: Clean database
+    clean_db()
+    
+    # Step 1: Download data
+    index, data_str = download_data()
+    if not index:
+        return
+    
+    # Step 2: Insert elements
+    insert_elements(index)
+    
+    # Step 3: Insert recipes
+    insert_recipes(index, data_str)
+    
+    # Summary
+    total_time = time.time() - overall_start
+    elem_count = elements_coll.count_documents({})
+    recipe_count = recipes_coll.count_documents({})
+    
     print(f"\n{'='*60}")
-    print(f"🎉 COMPLETE!")
-    print(f"   Elements: {elements_coll.count_documents({})}")
-    print(f"   Recipes: {recipes_coll.count_documents({})}")
-    print(f"   Time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"🎉 ALL DONE!")
+    print(f"   Elements: {elem_count}")
+    print(f"   Recipes: {recipe_count}")
+    print(f"   Time: {total_time:.0f}s ({total_time/60:.1f} min)")
     print(f"{'='*60}")
 
 if __name__ == "__main__":
