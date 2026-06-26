@@ -250,12 +250,33 @@ def main():
     if existing_elements > 100:
         print(f"✅ Direct Phase 3: Scraping recipes...")
         
-        # Get all elements from DB - ONLY name field (fast)
-        all_elements = elements_coll.find({}, {"name": 1})
+        # ===== FIX: Batch fetch, not single cursor =====
+        print("📥 Loading elements from DB in batches...")
         elem_list = []
-        for e in all_elements:
-            # Clean name: remove emoji for URL safety
-            clean_name = clean_element_name(e["name"])
+        
+        # Method 1: Use aggregation (fastest)
+        pipeline = [
+            {"$project": {"name": 1}},
+            {"$group": {"_id": None, "names": {"$addToSet": "$name"}}}
+        ]
+        result = list(elements_coll.aggregate(pipeline, allowDiskUse=True))
+        if result and result[0].get("names"):
+            raw_names = result[0]["names"]
+        else:
+            # Method 2: Fallback - batch fetch
+            raw_names = []
+            cursor = elements_coll.find({}, {"name": 1}).batch_size(5000).no_cursor_timeout()
+            try:
+                for doc in cursor:
+                    raw_names.append(doc["name"])
+            finally:
+                cursor.close()
+        
+        print(f"   ✅ {len(raw_names)} names loaded")
+        
+        # Clean names
+        for name in raw_names:
+            clean_name = clean_element_name(name)
             if clean_name and clean_name not in elem_list:
                 elem_list.append(clean_name)
         
@@ -268,6 +289,7 @@ def main():
         
         print(f"\n📥 Phase 3: {len(pending)} pending / {len(elem_list)} total")
     else:
+        # Phase 1: Decks se elements (existing code)
         elements = {}
         print("\n📥 Phase 1: Quick elements fetch...")
         for page in range(1, 7):
@@ -300,7 +322,7 @@ def main():
         elem_list = list(elements.keys())
         pending = [e for e in elem_list if e not in scraped]
     
-    # Phase 3: SCRAPE RECIPES NOW
+    # Phase 3: SCRAPE RECIPES NOW (rest same)
     print(f"\n{'='*60}")
     print(f"🚀 STARTING RECIPE SCRAPE: {len(pending)} elements")
     print(f"{'='*60}")
@@ -352,6 +374,3 @@ def main():
     print("🎉 COMPLETE!")
     print(f"   Elements: {elements_coll.count_documents({})}")
     print(f"   Recipes: {recipes_coll.count_documents({})}")
-
-if __name__ == "__main__":
-    main()
