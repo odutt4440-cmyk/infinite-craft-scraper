@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fake_useragent import UserAgent
 import os
 import sys
+import json  # NEW
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,8 +17,8 @@ load_dotenv()
 # ===== CONFIG =====
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://odutt4440_db_user:Gaming123@cluster0.hcbkwxy.mongodb.net/?appName=Cluster0")
 DB_NAME = os.getenv("DB_NAME", "infinite_craft")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "30"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "5"))  # FIXED: 30 -> 5 (rate limit avoid)
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))   # FIXED: 100 -> 20 (slow and steady)
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -44,16 +45,20 @@ def get_headers():
         "Connection": "keep-alive",
     }
 
-def fetch(url, retries=3):
+def fetch(url, retries=5):
     for a in range(retries):
         try:
-            time.sleep(0.3 + random.uniform(0, 0.3))
-            r = requests.get(url, headers=get_headers(), timeout=25)
+            time.sleep(1.5 + random.uniform(0, 1.5))  # FIXED: increased delay
+            r = requests.get(url, headers=get_headers(), timeout=30)
             if r.status_code == 200: return r
-            if r.status_code == 429: time.sleep((a+1)*5)
+            if r.status_code == 429:
+                wait = (a + 1) * 15
+                print(f"⏳ Rate limited, waiting {wait}s...")
+                time.sleep(wait)
             if r.status_code == 404: return None
-        except:
-            if a < retries-1: time.sleep(3)
+        except Exception as e:
+            print(f"  ⚠️ Request error: {e}")
+            if a < retries - 1: time.sleep(5)
     return None
 
 def extract_emoji_prefix(text):
@@ -65,13 +70,10 @@ def extract_emoji_prefix(text):
     return "", text
 
 def clean_element_name(name):
-    """Remove all emojis from element name for URL building"""
     _, clean = extract_emoji_prefix(name)
     if not clean:
         clean = name
-    # Remove any remaining emoji/special chars from middle/end
     clean = re.sub(r'[\U0001F300-\U0010FFFF\u2600-\u27BF\u2300-\u23FF\u00A9\u00AE\u2122\u200D\uFE0F\u20E3\u20E0\u0023\u002A\u0030-\u0039]', '', clean).strip()
-    # Remove double spaces
     clean = re.sub(r'\s+', ' ', clean).strip()
     return clean
 
@@ -79,7 +81,6 @@ def scrape_recipes_from_page(soup):
     recipes = []
     seen = set()
     
-    # Get ALL text from body
     body = soup.find('body')
     if not body: return recipes
     
@@ -91,7 +92,6 @@ def scrape_recipes_from_page(soup):
         if not line or len(line) > 300:
             continue
         
-        # Must have + and = 
         if '+' not in line or '=' not in line:
             continue
         
@@ -102,12 +102,10 @@ def scrape_recipes_from_page(soup):
         left = parts[0].strip()
         right = parts[1].strip()
         
-        # Left side must have exactly one +
         plus_count = left.count('+')
         if plus_count != 1:
             continue
         
-        # Split by +  
         plus_parts = left.split('+')
         if len(plus_parts) != 2:
             continue
@@ -115,36 +113,28 @@ def scrape_recipes_from_page(soup):
         first_raw = plus_parts[0].strip()
         second_raw = plus_parts[1].strip()
         
-        # Extract emoji and name
         f_emoji, f_name = extract_emoji_prefix(first_raw)
         s_emoji, s_name = extract_emoji_prefix(second_raw)
         
-        # If only emoji without name, use the raw text as name
         if not f_name and first_raw:
-            # Could be just emoji, skip
             continue
         if not s_name and second_raw:
             continue
         
-        # For result
         r_emoji, r_name = extract_emoji_prefix(right)
         if not r_name and right:
             continue
         
-        # Clean and validate
         f_name = f_name.strip()
         s_name = s_name.strip()
         r_name = r_name.strip()
         
-        # Basic validation - names should be at least 1 char
         if not f_name or not s_name or not r_name:
             continue
         
-        # Avoid garbage lines (too short or too long names)
         if len(f_name) > 80 or len(s_name) > 80 or len(r_name) > 80:
             continue
         
-        # Must start with a letter (not symbol/number)
         if not f_name[0].isalpha() or not s_name[0].isalpha() or not r_name[0].isalpha():
             continue
         
@@ -164,7 +154,6 @@ def scrape_element(name):
         return None
     name = name.strip()
     
-    # CRITICAL FIX: Remove emoji from name before building URL
     clean_name = clean_element_name(name)
     if not clean_name:
         print(f"  ⚠️ {name[:30]} -> empty after cleaning")
@@ -173,16 +162,15 @@ def scrape_element(name):
     url_name = quote(clean_name.replace(' ', '-'))
     url = f"{BASE}/recipes/{url_name}"
     
-    print(f"  🔍 {clean_name[:35]}", end="")
+    print(f"  🔍 {clean_name[:35]}", end="", flush=True)
     resp = fetch(url)
     if not resp:
-        print(" ❌")
+        print(" ❌", flush=True)
         return None
     
     soup = BeautifulSoup(resp.text, 'lxml')
     recipes = scrape_recipes_from_page(soup)
     
-    # Extract emoji from title
     elem_emoji = ""
     title_tag = soup.find('title')
     if title_tag:
@@ -193,9 +181,9 @@ def scrape_element(name):
             elem_emoji = e_emoji
     
     if len(recipes) > 0:
-        print(f" ✅ {len(recipes)} recipes")
+        print(f" ✅ {len(recipes)} recipes", flush=True)
     else:
-        print(f" ⚠️ 0 recipes")
+        print(f" ⚠️ 0 recipes", flush=True)
     
     return {
         "element": {"name": clean_name, "emoji": elem_emoji, "url": url},
@@ -226,53 +214,34 @@ def save(data):
 def load_progress():
     d = progress_coll.find_one({"_id": "p"})
     s = set(d.get("e", [])) if d else set()
-    # Also check existing recipes in DB
-    recipe_elements = set()
-    for r in recipes_coll.find({}, {"result": 1}):
-        recipe_elements.add(r.get("result", ""))
-    s.update(recipe_elements)
+    # ===== FIX: NO cursor iteration over 7L docs =====
+    # Sirf progress doc se load karo, recipes_coll se nahi
     return s
 
 def save_progress(s):
     progress_coll.update_one({"_id": "p"}, {"$set": {"e": list(s)}}, upsert=True)
 
 def main():
-    print("=" * 60)
-    print("🔥 INFINITE CRAFT - FAST RECIPE SCRAPE (FIXED)")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("🔥 INFINITE CRAFT - FAST RECIPE SCRAPE (FIXED)", flush=True)
+    print("=" * 60, flush=True)
     
     existing_elements = elements_coll.count_documents({})
     existing_recipes = recipes_coll.count_documents({})
     scraped = load_progress()
     
-    print(f"\n📊 DB: {existing_elements} elements | {existing_recipes} recipes | {len(scraped)} scraped")
+    print(f"\n📊 DB: {existing_elements} elements | {existing_recipes} recipes | {len(scraped)} scraped", flush=True)
     
     if existing_elements > 100:
-        print(f"✅ Direct Phase 3: Scraping recipes...")
+        print(f"✅ Direct Phase 3: Scraping recipes...", flush=True)
         
-        # ===== FIX: Batch fetch, not single cursor =====
-        print("📥 Loading elements from DB in batches...")
+        print("📥 Loading elements from DB...", flush=True)
         elem_list = []
         
-        # Method 1: Use aggregation (fastest)
-        pipeline = [
-            {"$project": {"name": 1}},
-            {"$group": {"_id": None, "names": {"$addToSet": "$name"}}}
-        ]
-        result = list(elements_coll.aggregate(pipeline, allowDiskUse=True))
-        if result and result[0].get("names"):
-            raw_names = result[0]["names"]
-        else:
-            # Method 2: Fallback - batch fetch
-            raw_names = []
-            cursor = elements_coll.find({}, {"name": 1}).batch_size(5000).no_cursor_timeout()
-            try:
-                for doc in cursor:
-                    raw_names.append(doc["name"])
-            finally:
-                cursor.close()
-        
-        print(f"   ✅ {len(raw_names)} names loaded")
+        # ===== FIX: Use distinct() instead of aggregation/find =====
+        # Yeh sabse fast aur memory-efficient hai
+        raw_names = list(elements_coll.distinct("name"))
+        print(f"   ✅ {len(raw_names)} distinct names loaded", flush=True)
         
         # Clean names
         for name in raw_names:
@@ -287,11 +256,10 @@ def main():
         
         pending = [e for e in elem_list if e not in scraped]
         
-        print(f"\n📥 Phase 3: {len(pending)} pending / {len(elem_list)} total")
+        print(f"\n📥 Phase 3: {len(pending)} pending / {len(elem_list)} total", flush=True)
     else:
-        # Phase 1: Decks se elements (existing code)
         elements = {}
-        print("\n📥 Phase 1: Quick elements fetch...")
+        print("\n📥 Phase 1: Quick elements fetch...", flush=True)
         for page in range(1, 7):
             url = f"{BASE}/decks" if page == 1 else f"{BASE}/decks?page={page}"
             resp = fetch(url)
@@ -311,21 +279,20 @@ def main():
                                 nm = unquote(l2['href'].split('/recipes/')[-1]).replace('-', ' ')
                             if nm and nm not in elements:
                                 elements[nm] = em
-            print(f"   Page {page}: {len(elements)} so far")
+            print(f"   Page {page}: {len(elements)} so far", flush=True)
         
         for nm, em in elements.items():
             try:
                 elements_coll.update_one({"name": nm}, {"$set": {"name": nm, "emoji": em}}, upsert=True)
             except: pass
         
-        print(f"✅ {len(elements)} elements from decks")
+        print(f"✅ {len(elements)} elements from decks", flush=True)
         elem_list = list(elements.keys())
         pending = [e for e in elem_list if e not in scraped]
     
-    # Phase 3: SCRAPE RECIPES NOW (rest same)
-    print(f"\n{'='*60}")
-    print(f"🚀 STARTING RECIPE SCRAPE: {len(pending)} elements")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"🚀 STARTING RECIPE SCRAPE: {len(pending)} elements", flush=True)
+    print(f"{'='*60}", flush=True)
     
     batch_num = 0
     total_start = time.time()
@@ -333,15 +300,15 @@ def main():
     while pending:
         elapsed = time.time() - START_TIME
         if elapsed > TIMEOUT:
-            print(f"\n⏰ Timeout. Saving progress ({len(scraped)} done)...")
+            print(f"\n⏰ Timeout. Saving progress ({len(scraped)} done)...", flush=True)
             save_progress(scraped)
-            print("✅ Will continue on restart")
+            print("✅ Will continue on restart", flush=True)
             sys.exit(0)
         
         batch_num += 1
         batch = pending[:BATCH_SIZE]
         
-        print(f"\n📦 Batch {batch_num}: {len(batch)} elements")
+        print(f"\n📦 Batch {batch_num}: {len(batch)} elements", flush=True)
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(scrape_element, e): e for e in batch}
@@ -368,9 +335,12 @@ def main():
         rate = len(scraped) / (elapsed_total / 60) if elapsed_total > 0 else 0
         eta = (len(pending) / rate) if rate > 0 else 0
         
-        print(f"   📊 {len(scraped)} done | {tr} recipes | {te} elements | {len(pending)} left | ~{int(eta)} min")
+        print(f"   📊 {len(scraped)} done | {tr} recipes | {te} elements | {len(pending)} left | ~{int(eta)} min", flush=True)
     
-    print("\n" + "=" * 60)
-    print("🎉 COMPLETE!")
-    print(f"   Elements: {elements_coll.count_documents({})}")
-    print(f"   Recipes: {recipes_coll.count_documents({})}")
+    print("\n" + "=" * 60, flush=True)
+    print("🎉 COMPLETE!", flush=True)
+    print(f"   Elements: {elements_coll.count_documents({})}", flush=True)
+    print(f"   Recipes: {recipes_coll.count_documents({})}", flush=True)
+
+if __name__ == "__main__":
+    main()
