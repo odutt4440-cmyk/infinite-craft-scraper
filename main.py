@@ -64,28 +64,53 @@ def extract_emoji_prefix(text):
         return emoji_match.group(1).strip(), emoji_match.group(2).strip()
     return "", text
 
+def clean_element_name(name):
+    """Remove all emojis from element name for URL building"""
+    _, clean = extract_emoji_prefix(name)
+    if not clean:
+        clean = name
+    # Remove any remaining emoji/special chars from middle/end
+    clean = re.sub(r'[\U0001F300-\U0010FFFF\u2600-\u27BF\u2300-\u23FF\u00A9\u00AE\u2122\u200D\uFE0F\u20E3\u20E0\u0023\u002A\u0030-\u0039]', '', clean).strip()
+    # Remove double spaces
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean
+
 def scrape_recipes_from_page(soup):
     recipes = []
     seen = set()
+    
+    # Get ALL text from body
     body = soup.find('body')
     if not body: return recipes
+    
     body_text = body.get_text(separator='\n')
     lines = body_text.split('\n')
     
     for line in lines:
         line = line.strip()
-        if not line or len(line) > 300 or '+' not in line or '=' not in line:
+        if not line or len(line) > 300:
             continue
         
-        # Direct pattern: "Water + Fire = Steam" or "💧 Water + 🔥 Fire = 💨 Steam"
-        # Simplified pattern - more forgiving
+        # Must have + and = 
+        if '+' not in line or '=' not in line:
+            continue
+        
         parts = line.split('=')
-        if len(parts) != 2: continue
+        if len(parts) != 2:
+            continue
+        
         left = parts[0].strip()
         right = parts[1].strip()
         
+        # Left side must have exactly one +
+        plus_count = left.count('+')
+        if plus_count != 1:
+            continue
+        
+        # Split by +  
         plus_parts = left.split('+')
-        if len(plus_parts) != 2: continue
+        if len(plus_parts) != 2:
+            continue
         
         first_raw = plus_parts[0].strip()
         second_raw = plus_parts[1].strip()
@@ -94,41 +119,70 @@ def scrape_recipes_from_page(soup):
         f_emoji, f_name = extract_emoji_prefix(first_raw)
         s_emoji, s_name = extract_emoji_prefix(second_raw)
         
-        if not f_name: continue
-        if not s_name: continue
+        # If only emoji without name, use the raw text as name
+        if not f_name and first_raw:
+            # Could be just emoji, skip
+            continue
+        if not s_name and second_raw:
+            continue
         
         # For result
         r_emoji, r_name = extract_emoji_prefix(right)
-        if not r_name: continue
+        if not r_name and right:
+            continue
         
-        # Clean names
+        # Clean and validate
         f_name = f_name.strip()
         s_name = s_name.strip()
         r_name = r_name.strip()
         
-        if f_name and s_name and r_name:
-            key = (f_name.lower(), s_name.lower(), r_name.lower())
-            if key not in seen:
-                seen.add(key)
-                recipes.append({
-                    "first": f_name, "first_emoji": f_emoji,
-                    "second": s_name, "second_emoji": s_emoji,
-                    "result": r_name, "result_emoji": r_emoji
-                })
+        # Basic validation - names should be at least 1 char
+        if not f_name or not s_name or not r_name:
+            continue
+        
+        # Avoid garbage lines (too short or too long names)
+        if len(f_name) > 80 or len(s_name) > 80 or len(r_name) > 80:
+            continue
+        
+        # Must start with a letter (not symbol/number)
+        if not f_name[0].isalpha() or not s_name[0].isalpha() or not r_name[0].isalpha():
+            continue
+        
+        key = (f_name.lower(), s_name.lower(), r_name.lower())
+        if key not in seen:
+            seen.add(key)
+            recipes.append({
+                "first": f_name, "first_emoji": f_emoji,
+                "second": s_name, "second_emoji": s_emoji,
+                "result": r_name, "result_emoji": r_emoji
+            })
+    
     return recipes
 
 def scrape_element(name):
-    if not name or not name.strip(): return None
+    if not name or not name.strip():
+        return None
     name = name.strip()
-    url_name = quote(name.replace(' ', '-'))
+    
+    # CRITICAL FIX: Remove emoji from name before building URL
+    clean_name = clean_element_name(name)
+    if not clean_name:
+        print(f"  ⚠️ {name[:30]} -> empty after cleaning")
+        return None
+    
+    url_name = quote(clean_name.replace(' ', '-'))
     url = f"{BASE}/recipes/{url_name}"
-    print(f"  🔍 {name[:30]}", end="")
+    
+    print(f"  🔍 {clean_name[:35]}", end="")
     resp = fetch(url)
     if not resp:
         print(" ❌")
         return None
+    
     soup = BeautifulSoup(resp.text, 'lxml')
     recipes = scrape_recipes_from_page(soup)
+    
+    # Extract emoji from title
     elem_emoji = ""
     title_tag = soup.find('title')
     if title_tag:
@@ -137,22 +191,26 @@ def scrape_element(name):
         if m:
             e_emoji, _ = extract_emoji_prefix(m.group(1).strip())
             elem_emoji = e_emoji
+    
     if len(recipes) > 0:
         print(f" ✅ {len(recipes)} recipes")
     else:
         print(f" ⚠️ 0 recipes")
+    
     return {
-        "element": {"name": name, "emoji": elem_emoji, "url": url},
+        "element": {"name": clean_name, "emoji": elem_emoji, "url": url},
         "recipes": recipes
     }
 
 def save(data):
-    if not data: return set()
+    if not data:
+        return set()
     new = set()
     if data.get('element'):
         try:
             elements_coll.update_one({"name": data['element']['name']}, {"$set": data['element']}, upsert=True)
-        except: pass
+        except:
+            pass
     for r in data.get('recipes', []):
         new.update([r['first'], r['second'], r['result']])
         try:
@@ -161,7 +219,8 @@ def save(data):
                 {"$set": r},
                 upsert=True
             )
-        except: pass
+        except:
+            pass
     return new
 
 def load_progress():
@@ -179,7 +238,7 @@ def save_progress(s):
 
 def main():
     print("=" * 60)
-    print("🔥 INFINITE CRAFT - FAST RECIPE SCRAPE")
+    print("🔥 INFINITE CRAFT - FAST RECIPE SCRAPE (FIXED)")
     print("=" * 60)
     
     existing_elements = elements_coll.count_documents({})
@@ -193,9 +252,14 @@ def main():
         
         # Get all elements from DB - ONLY name field (fast)
         all_elements = elements_coll.find({}, {"name": 1})
-        elem_list = [e["name"] for e in all_elements]
+        elem_list = []
+        for e in all_elements:
+            # Clean name: remove emoji for URL safety
+            clean_name = clean_element_name(e["name"])
+            if clean_name and clean_name not in elem_list:
+                elem_list.append(clean_name)
         
-        # Add basics
+        # Add basics if missing
         for b in ["Water", "Fire", "Wind", "Earth"]:
             if b not in elem_list:
                 elem_list.insert(0, b)
@@ -204,7 +268,6 @@ def main():
         
         print(f"\n📥 Phase 3: {len(pending)} pending / {len(elem_list)} total")
     else:
-        # Minimal Phase 1 - only if DB empty
         elements = {}
         print("\n📥 Phase 1: Quick elements fetch...")
         for page in range(1, 7):
@@ -270,7 +333,7 @@ def main():
                             if n not in elem_list:
                                 elem_list.append(n)
                                 pending.append(n)
-                except:
+                except Exception as e:
                     pass
         
         save_progress(scraped)
