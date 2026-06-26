@@ -36,6 +36,8 @@ BASE = "https://infinitecraftrecipe.com"
 START_TIME = time.time()
 TIMEOUT = 2400
 
+NAMES_CACHE_FILE = "element_names_cache.json"
+
 def get_headers():
     return {
         "User-Agent": ua.random,
@@ -219,6 +221,50 @@ def load_progress():
 def save_progress(s):
     progress_coll.update_one({"_id": "p"}, {"$set": {"e": list(s)}}, upsert=True)
 
+def load_element_names():
+    """Load names from cache file if exists, else from DB"""
+    if os.path.exists(NAMES_CACHE_FILE):
+        print("📥 Loading elements from cache file...", flush=True)
+        with open(NAMES_CACHE_FILE, "r") as f:
+            names = set(json.load(f))
+        print(f"   ✅ {len(names)} names loaded from cache", flush=True)
+        return names
+    
+    print("📥 Loading elements from DB in pages...", flush=True)
+    raw_names = set()
+    page_size = 20000
+    last_id = None
+    total = 0
+    
+    while True:
+        if last_id is None:
+            docs = list(elements_coll.find({}, {"name": 1, "_id": 1})
+                        .sort("_id", 1)
+                        .limit(page_size))
+        else:
+            docs = list(elements_coll.find({"_id": {"$gt": last_id}}, {"name": 1, "_id": 1})
+                        .sort("_id", 1)
+                        .limit(page_size))
+        
+        if not docs:
+            break
+        
+        for doc in docs:
+            name = doc.get("name", "")
+            if name:
+                raw_names.add(name)
+            last_id = doc["_id"]
+        
+        total += len(docs)
+        print(f"   ... {total} loaded", flush=True)
+    
+    # Save to cache file
+    print("   💾 Saving to cache file...", flush=True)
+    with open(NAMES_CACHE_FILE, "w") as f:
+        json.dump(list(raw_names), f)
+    print(f"   ✅ {len(raw_names)} names loaded and cached", flush=True)
+    return raw_names
+
 def main():
     print("=" * 60, flush=True)
     print("🔥 INFINITE CRAFT - FAST RECIPE SCRAPE (FIXED)", flush=True)
@@ -233,40 +279,11 @@ def main():
     if existing_elements > 100:
         print(f"✅ Direct Phase 3: Scraping recipes...", flush=True)
         
-        print("📥 Loading elements from DB in pages...", flush=True)
-        elem_list = []
-        raw_names = set()
-        
-        # ===== FINAL FIX: Paginated fetch, NOT cursor =====
-        page_size = 20000
-        last_id = None
-        total = 0
-        
-        while True:
-            if last_id is None:
-                docs = list(elements_coll.find({}, {"name": 1, "_id": 1})
-                            .sort("_id", 1)
-                            .limit(page_size))
-            else:
-                docs = list(elements_coll.find({"_id": {"$gt": last_id}}, {"name": 1, "_id": 1})
-                            .sort("_id", 1)
-                            .limit(page_size))
-            
-            if not docs:
-                break
-            
-            for doc in docs:
-                name = doc.get("name", "")
-                if name:
-                    raw_names.add(name)
-                last_id = doc["_id"]
-            
-            total += len(docs)
-            print(f"   ... {total} loaded", flush=True)
-        
-        print(f"   ✅ {len(raw_names)} names loaded", flush=True)
+        # Load names (from cache or DB)
+        raw_names = load_element_names()
         
         # Clean names
+        elem_list = []
         for name in raw_names:
             clean_name = clean_element_name(name)
             if clean_name and clean_name not in elem_list:
