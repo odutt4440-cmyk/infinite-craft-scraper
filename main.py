@@ -11,19 +11,19 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
+import math
 
 load_dotenv()
 
 # ===== CONFIG =====
 MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://odutt4440_db_user:Gaming123@cluster0.hcbkwxy.mongodb.net/?appName=Cluster0")
 DB_NAME = os.getenv("DB_NAME", "infinite_craft")
-RECIPES_COLL = os.getenv("RECIPES_COLL", "website_recipes")
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "30"))  # 30 workers now
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
-recipes_coll = db[RECIPES_COLL]
+recipes_coll = db["website_recipes"]
 elements_coll = db["website_elements"]
 progress_coll = db["scraping_progress"]
 
@@ -34,9 +34,8 @@ elements_coll.create_index([("name", 1)], unique=True)
 ua = UserAgent()
 BASE = "https://infinitecraftrecipe.com"
 
-# Railway timeout handle - restart ke baad continue
 START_TIME = time.time()
-TIMEOUT = 2400  # 40 min (Railway 30 min timeout + buffer)
+TIMEOUT = 2400  # 40 min
 
 def get_headers():
     return {
@@ -47,16 +46,16 @@ def get_headers():
         "Connection": "keep-alive",
     }
 
-def fetch(url, retries=5):
+def fetch(url, retries=3):
     for a in range(retries):
         try:
-            time.sleep(0.5 + random.uniform(0, 0.5))
-            r = requests.get(url, headers=get_headers(), timeout=30)
+            time.sleep(0.3 + random.uniform(0, 0.3))
+            r = requests.get(url, headers=get_headers(), timeout=25)
             if r.status_code == 200: return r
-            if r.status_code == 429: time.sleep((a+1)*10)
+            if r.status_code == 429: time.sleep((a+1)*5)
             if r.status_code == 404: return None
         except:
-            if a < retries-1: time.sleep(5)
+            if a < retries-1: time.sleep(3)
     return None
 
 def extract_emoji_prefix(text):
@@ -79,12 +78,12 @@ def scrape_recipes_from_page(soup):
         line = line.strip()
         if not line or len(line) > 300: continue
         m = re.match(
-            r'((?:[\U0001F300-\U0010FFFF\u2600-\u27BF\u2300-\u23FF\u00A9\u00AE\u2122\u200D\uFE0F\u20E3\u20E0\u0023\u002A\u0030-\u0039]+\s*)?'
-            r'([A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9\s\'\-\.\(\)]+?))\s*\+\s*'
-            r'((?:[\U0001F300-\U0010FFFF\u2600-\u27BF\u2300-\u23FF\u00A9\u00AE\u2122\u200D\uFE0F\u20E3\u20E0\u0023\u002A\u0030-\u0039]+\s*)?'
-            r'([A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9\s\'\-\.\(\)]+?))\s*=\s*'
-            r'((?:[\U0001F300-\U0010FFFF\u2600-\u27BF\u2300-\u23FF\u00A9\u00AE\u2122\u200D\uFE0F\u20E3\u20E0\u0023\u002A\u0030-\u0039]+\s*)?'
-            r'([A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9\s\'\-\.\(\)]+?))(?:\s|$)',
+            r'((?:[\U0001F300-\U0010FFFF\u2600-\u27BF]+\s*)?'
+            r'([A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9\s\'\-\.\(\)]*?))\s*\+\s*'
+            r'((?:[\U0001F300-\U0010FFFF\u2600-\u27BF]+\s*)?'
+            r'([A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9\s\'\-\.\(\)]*?))\s*=\s*'
+            r'((?:[\U0001F300-\U0010FFFF\u2600-\u27BF]+\s*)?'
+            r'([A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9\s\'\-\.\(\)]*?))(?:\s|$)',
             line
         )
         if m:
@@ -126,69 +125,30 @@ def scrape_element(name):
         if m:
             e_emoji, _ = extract_emoji_prefix(m.group(1).strip())
             elem_emoji = e_emoji
-    print(f" ✅ {len(recipes)} recipes")
+    if len(recipes) > 0:
+        print(f" ✅ {len(recipes)} recipes")
+    else:
+        print(f" ⚠️ 0 recipes", end="")
+        # Try alternate scrape - check page text directly
+        txt = soup.get_text()
+        alt_recipes = re.findall(r'([A-Za-z][A-Za-z0-9\s\'-]+)\s*\+\s*([A-Za-z][A-Za-z0-9\s\'-]+)\s*=\s*([A-Za-z][A-Za-z0-9\s\'-]+)', txt)
+        if alt_recipes:
+            for f, s, r in alt_recipes[:5]:
+                f = f.strip()[:50]
+                s = s.strip()[:50]
+                r = r.strip()[:50]
+                if f and s and r:
+                    key = (f.lower(), s.lower(), r.lower())
+                    if key not in seen:
+                        seen.add(key)
+                        recipes.append({"first": f, "first_emoji": "", "second": s, "second_emoji": "", "result": r, "result_emoji": ""})
+            print(f" → found {len(recipes)} recipes (alt)")
+        else:
+            print()
     return {
         "element": {"name": name, "emoji": elem_emoji, "url": url},
         "recipes": recipes
     }
-
-def get_deck_elements():
-    all_elems = {"Water": "💧", "Fire": "🔥", "Wind": "💨", "Earth": "🌎"}
-    print("\n📥 Phase 1: Decks se elements...")
-    for page in range(1, 7):
-        url = f"{BASE}/decks" if page == 1 else f"{BASE}/decks?page={page}"
-        resp = fetch(url)
-        if not resp: break
-        soup = BeautifulSoup(resp.text, 'lxml')
-        deck_urls = []
-        for link in soup.find_all('a', href=True):
-            if '/deck/' in link['href']:
-                deck_urls.append(link['href'] if link['href'].startswith('http') else f"{BASE}{link['href']}")
-        print(f"   Page {page}: {len(deck_urls)} decks")
-        for d in deck_urls:
-            resp2 = fetch(d)
-            if not resp2: continue
-            soup2 = BeautifulSoup(resp2.text, 'lxml')
-            for l2 in soup2.find_all('a', href=True):
-                if '/recipes/' in l2['href'] and 'login' not in l2['href'].lower():
-                    txt = l2.get_text(strip=True)
-                    em, nm = extract_emoji_prefix(txt)
-                    if not nm:
-                        nm = unquote(l2['href'].split('/recipes/')[-1]).replace('-', ' ')
-                    if nm and nm not in all_elems:
-                        all_elems[nm] = em
-    print(f"   ✅ {len(all_elems)} elements from decks")
-    return all_elems
-
-def get_sitemap_elements():
-    all_elems = {}
-    print("\n📥 Phase 2: Sitemaps se elements...")
-    robots = fetch(f"{BASE}/robots.txt")
-    if not robots: return all_elems
-    sitemaps = re.findall(r'Sitemap:\s*(https?://\S+)', robots.text)
-    print(f"   {len(sitemaps)} sitemaps")
-    for sm in sitemaps:
-        print(f"   📄 {sm.split('/')[-1]}", end="")
-        resp = fetch(sm)
-        if not resp:
-            print(" ❌")
-            continue
-        try:
-            root = ET.fromstring(resp.content)
-            ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-            count = 0
-            for loc in root.findall('.//ns:loc', ns):
-                if loc.text and '/recipes/' in loc.text:
-                    name_part = loc.text.split('/recipes/')[-1].split('?')[0]
-                    name = unquote(name_part).replace('-', ' ')
-                    if name and name not in all_elems:
-                        all_elems[name] = ""
-                        count += 1
-            print(f" ✅ {count}")
-        except Exception as e:
-            print(f" ⚠️ {e}")
-    print(f"   ✅ {len(all_elems)} from sitemaps")
-    return all_elems
 
 def save(data):
     if not data: return set()
@@ -201,7 +161,7 @@ def save(data):
         new.update([r['first'], r['second'], r['result']])
         try:
             recipes_coll.update_one(
-                {"first": r['first'], "second": r['second']},
+                {"result": r['result'], "first": r['first'], "second": r['second']},
                 {"$set": r},
                 upsert=True
             )
@@ -210,59 +170,169 @@ def save(data):
 
 def load_progress():
     d = progress_coll.find_one({"_id": "p"})
-    return set(d.get("e", [])) if d else set()
+    s = set(d.get("e", [])) if d else set()
+    # Also check existing recipes in DB
+    recipe_elements = set()
+    for r in recipes_coll.find({}, {"result": 1}):
+        recipe_elements.add(r.get("result", ""))
+    s.update(recipe_elements)
+    return s
 
 def save_progress(s):
     progress_coll.update_one({"_id": "p"}, {"$set": {"e": list(s)}}, upsert=True)
 
+def migrate_old_element_emoji():
+    """Elements from sitemap have empty emoji. Fix from title tags"""
+    print("\n📥 Phase X: Updating missing emojis in DB...")
+    missing_emoji = list(elements_coll.find({"emoji": {"$in": ["", None]}}, {"name": 1}).limit(10))
+    print(f"   Elements with missing emoji: {elements_coll.count_documents({'emoji': {'$in': ['', None]}})}")
+    if missing_emoji:
+        print("   (will fix during Phase 3 recipe scrape)")
+
 def main():
     print("=" * 60)
-    print("🔥 INFINITE CRAFT - ALL DATA (18L+ RECIPES)")
+    print("🔥 INFINITE CRAFT - ALL DATA (PHASE 3 ONLY)")
     print("=" * 60)
     
+    # Check existing DB
+    existing_elements = elements_coll.count_documents({})
+    existing_recipes = recipes_coll.count_documents({})
     scraped = load_progress()
     
     print(f"\n📊 DB Status:")
-    print(f"   Elements: {elements_coll.count_documents({})}")
-    print(f"   Recipes: {recipes_coll.count_documents({})}")
+    print(f"   Elements in DB: {existing_elements}")
+    print(f"   Recipes in DB: {existing_recipes}")
     print(f"   Already scraped: {len(scraped)}")
     
-    # Phase 1: Decks
-    elements = get_deck_elements()
+    # If DB has elements, skip Phase 1 & 2 - direct Phase 3
+    if existing_elements > 100:
+        print(f"\n✅ Elements already in DB ({existing_elements}). Skipping Phase 1 & 2...")
+        print(f"📥 Direct Phase 3: Recipe scrape")
+        
+        # Get all elements from DB
+        all_elements = list(elements_coll.find({}, {"name": 1}))
+        elem_list = [e["name"] for e in all_elements]
+        
+        # Add basic 4 if missing
+        basics = {"Water", "Fire", "Wind", "Earth"}
+        for b in basics:
+            if b not in elem_list:
+                elem_list.append(b)
+                try:
+                    elements_coll.update_one({"name": b}, {"$set": {"name": b, "emoji": ""}}, upsert=True)
+                except: pass
+        
+        pending = [e for e in elem_list if e not in scraped]
+        print(f"   {len(pending)} elements pending for recipe scrape")
+        
+        # Also add new elements discovered from sitemaps
+        print("\n📥 Phase 2.5: Checking sitemaps for NEW elements...")
+        robots = fetch(f"{BASE}/robots.txt")
+        if robots:
+            sitemaps = re.findall(r'Sitemap:\s*(https?://\S+)', robots.text)
+            new_count = 0
+            for sm in sitemaps:
+                resp = fetch(sm)
+                if not resp: continue
+                try:
+                    root = ET.fromstring(resp.content)
+                    ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+                    for loc in root.findall('.//ns:loc', ns):
+                        if loc.text and '/recipes/' in loc.text:
+                            name_part = loc.text.split('/recipes/')[-1].split('?')[0]
+                            name = unquote(name_part).replace('-', ' ')
+                            if name and name not in elem_list:
+                                elem_list.append(name)
+                                pending.append(name)
+                                new_count += 1
+                except: pass
+            print(f"   {new_count} new elements found from sitemaps")
+        
+        migrate_old_element_emoji()
+        
+    else:
+        print(f"\n⚠️ DB empty! Running Phase 1 & 2 first...")
+        # Original Phase 1 & 2 code
+        elements = {}
+        print("\n📥 Phase 1: Decks se elements...")
+        for page in range(1, 7):
+            url = f"{BASE}/decks" if page == 1 else f"{BASE}/decks?page={page}"
+            resp = fetch(url)
+            if not resp: break
+            soup = BeautifulSoup(resp.text, 'lxml')
+            deck_urls = []
+            for link in soup.find_all('a', href=True):
+                if '/deck/' in link['href']:
+                    deck_urls.append(link['href'] if link['href'].startswith('http') else f"{BASE}{link['href']}")
+            print(f"   Page {page}: {len(deck_urls)} decks")
+            for d in deck_urls:
+                resp2 = fetch(d)
+                if not resp2: continue
+                soup2 = BeautifulSoup(resp2.text, 'lxml')
+                for l2 in soup2.find_all('a', href=True):
+                    if '/recipes/' in l2['href'] and 'login' not in l2['href'].lower():
+                        txt = l2.get_text(strip=True)
+                        em, nm = extract_emoji_prefix(txt)
+                        if not nm:
+                            nm = unquote(l2['href'].split('/recipes/')[-1]).replace('-', ' ')
+                        if nm and nm not in elements:
+                            elements[nm] = em
+        print(f"   ✅ {len(elements)} elements from decks")
+        
+        print("\n📥 Phase 2: Sitemaps se elements...")
+        robots = fetch(f"{BASE}/robots.txt")
+        if robots:
+            sitemaps = re.findall(r'Sitemap:\s*(https?://\S+)', robots.text)
+            print(f"   {len(sitemaps)} sitemaps")
+            for sm in sitemaps:
+                print(f"   📄 {sm.split('/')[-1]}", end="")
+                resp = fetch(sm)
+                if not resp:
+                    print(" ❌")
+                    continue
+                try:
+                    root = ET.fromstring(resp.content)
+                    ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+                    count = 0
+                    for loc in root.findall('.//ns:loc', ns):
+                        if loc.text and '/recipes/' in loc.text:
+                            name_part = loc.text.split('/recipes/')[-1].split('?')[0]
+                            name = unquote(name_part).replace('-', ' ')
+                            if name and name not in elements:
+                                elements[name] = ""
+                                count += 1
+                    print(f" ✅ {count}")
+                except: pass
+        
+        print(f"   ✅ {len(elements)} from sitemaps")
+        
+        for nm, em in elements.items():
+            try:
+                elements_coll.update_one({"name": nm}, {"$set": {"name": nm, "emoji": em}}, upsert=True)
+            except: pass
+        
+        elem_list = list(elements.keys())
+        pending = [e for e in elem_list if e not in scraped]
     
-    # Phase 2: Sitemaps
-    sitemap_elems = get_sitemap_elements()
-    for nm in sitemap_elems:
-        if nm not in elements:
-            elements[nm] = ""
-    
-    print(f"\n📊 Total elements: {len(elements)}")
-    
-    # Save elements
-    for nm, em in elements.items():
-        try:
-            elements_coll.update_one({"name": nm}, {"$set": {"name": nm, "emoji": em}}, upsert=True)
-        except: pass
-    
-    # Phase 3: Scrape recipes
-    elem_list = list(elements.keys())
-    pending = [e for e in elem_list if e not in scraped]
-    
+    # Phase 3: Recipe scrape
     print(f"\n📥 Phase 3: Recipe scrape ({len(pending)} pending)")
     
     batch_num = 0
+    total_start = time.time()
+    
     while pending:
-        # Railway timeout check
-        if time.time() - START_TIME > TIMEOUT:
-            print(f"\n⏰ Timeout approaching ({TIMEOUT}s). Saving progress and exiting...")
+        # Railway timeout check (with Buffer)
+        elapsed = time.time() - START_TIME
+        if elapsed > TIMEOUT:
+            print(f"\n⏰ Timeout ({TIMEOUT}s). Saving & exiting...")
             save_progress(scraped)
-            print("✅ Progress saved. Railway will restart and continue.")
+            print("✅ Continue on restart...")
             sys.exit(0)
         
         batch_num += 1
         batch = pending[:BATCH_SIZE]
         
-        print(f"\n📦 Batch {batch_num}: {len(batch)} elements")
+        print(f"\n📦 Batch {batch_num}: {len(batch)} elements (🕐 {int(elapsed)}s elapsed)")
         
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = {ex.submit(scrape_element, e): e for e in batch}
@@ -273,10 +343,11 @@ def main():
                         new = save(data)
                         scraped.add(data['element']['name'])
                         for n in new:
-                            if n not in elements:
-                                elements[n] = ""
+                            if n not in elem_list:
                                 elem_list.append(n)
-                except: pass
+                                pending.append(n)
+                except Exception as e:
+                    pass
         
         save_progress(scraped)
         
@@ -284,7 +355,11 @@ def main():
         tr = recipes_coll.count_documents({})
         pending = [e for e in elem_list if e not in scraped]
         
-        print(f"   📊 {len(scraped)}/{len(elements)} done | {tr} recipes | {te} elements | {len(pending)} pending")
+        elapsed_total = time.time() - total_start
+        rate = len(scraped) / elapsed_total * 60 if elapsed_total > 0 else 0
+        remaining_mins = len(pending) / rate if rate > 0 else 0
+        
+        print(f"   📊 {len(scraped)}/{len(elem_list)} done | {tr} recipes | {te} elements | {len(pending)} pending | ~{int(remaining_mins)} min left")
     
     print("\n" + "=" * 60)
     print("🎉 ALL DATA COLLECTED!")
