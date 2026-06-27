@@ -15,9 +15,18 @@ jobs:
           python-version: '3.11'
       - run: pip install requests
       - run: python scrape_to_sqlite.py
-      - run: |
+      
+      - name: Split DB into chunks
+        run: |
+          split -b 50M infinite_craft.db.gz part_
+          ls -lh part_*
+      
+      - name: Commit and Push chunks
+        run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add infinite_craft.db.gz
-          git commit -m "Auto-update DB $(date +%Y-%m-%d)" || echo "No changes"
+          git add part_*
+          git rm --cached infinite_craft.db.gz 2>/dev/null || true
+          rm -f infinite_craft.db infinite_craft.db.gz
+          git commit -m "Auto-update DB chunks $(date +%Y-%m-%d)" || echo "No changes"
           git push
