@@ -8,7 +8,8 @@ import time
 
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://odutt4440_db_user:Gaming123@cluster0.hcbkwxy.mongodb.net/?appName=Cluster0")
+# ===== NEW MONGO CREDENTIALS =====
+MONGO_URI = "mongodb+srv://srishtidutt12_db_user:pCDhpXnv2bxhMs0r@cluster0.hcbkwxy.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 DB_NAME = "infinite_craft_bot"
 
 client = MongoClient(MONGO_URI)
@@ -18,21 +19,27 @@ elements_coll = db["website_elements"]
 
 DATA_URL = "https://github.com/expitau/InfiniteCraftWiki/raw/refs/heads/main/web/data/data.json"
 
-def clean_db():
-    """Pehle saare duplicates hatao aur fresh indexes banao"""
-    print("🧹 Cleaning database...")
+def setup_db():
+    """Pehle check karo ki collections exist karte hain ya nahi, agar nahi toh create karo"""
+    print("🔧 Setting up database...")
     
-    # 1. Drop both collections
-    recipes_coll.drop()
-    elements_coll.drop()
-    print("   ✅ Dropped old collections")
+    # Check if collections already exist
+    existing_collections = db.list_collection_names()
     
-    # 2. Fresh indexes
-    elements_coll.create_index([("name", 1)], unique=True)
-    elements_coll.create_index([("code", 1)], unique=True)
-    recipes_coll.create_index([("first", 1), ("second", 1)])
-    recipes_coll.create_index([("result", 1)])
-    print("   ✅ Fresh indexes created")
+    if "website_elements" not in existing_collections:
+        # Create collection with indexes
+        elements_coll.create_index([("name", 1)], unique=True)
+        elements_coll.create_index([("code", 1)], unique=True)
+        print("   ✅ Elements collection created with indexes")
+    else:
+        print("   ✅ Elements collection already exists")
+    
+    if "website_recipes" not in existing_collections:
+        recipes_coll.create_index([("first", 1), ("second", 1)])
+        recipes_coll.create_index([("result", 1)])
+        print("   ✅ Recipes collection created with indexes")
+    else:
+        print("   ✅ Recipes collection already exists")
 
 def download_data():
     """Download data.json"""
@@ -62,7 +69,6 @@ def insert_elements(index):
         name = elem[1]
         cost = elem[2] if len(elem) > 2 else 0
         
-        # Ordered=False means continue on error (skip duplicates silently)
         batch.append(
             UpdateOne(
                 {"name": name},
@@ -81,7 +87,6 @@ def insert_elements(index):
             try:
                 elements_coll.bulk_write(batch, ordered=False)
             except:
-                # Agar koi error aaye toh ek-ek karke try karo
                 for op in batch:
                     try:
                         elements_coll.bulk_write([op], ordered=False)
@@ -100,7 +105,8 @@ def insert_elements(index):
                 except:
                     pass
     
-    print(f"   ✅ Total: {elements_coll.count_documents({})} elements")
+    final_count = elements_coll.count_documents({})
+    print(f"   ✅ Total: {final_count} elements")
 
 def insert_recipes(index, data_str):
     """Bulk insert recipes - FAST"""
@@ -149,32 +155,39 @@ def insert_recipes(index, data_str):
         count += 1
         
         if len(batch) >= 10000:
-            recipes_coll.bulk_write(batch, ordered=False)
+            try:
+                recipes_coll.bulk_write(batch, ordered=False)
+            except:
+                pass
             batch = []
             
             elapsed = time.time() - start
             rate = count / (elapsed / 60) if elapsed > 0 else 0
             pct = (i / total) * 100
-            eta = (total - i) / (rate / 60) if rate > 0 else 0
+            eta = (total - i) / rate * 60 if rate > 0 else 0
             
-            print(f"   ✅ {count} recipes ({pct:.0f}%) | {rate:.0f}/min | ETA: {eta:.0f} min")
+            print(f"   ✅ {count} recipes ({pct:.0f}%) | {rate:.0f}/min | ETA: {eta:.0f}s")
     
     if batch:
-        recipes_coll.bulk_write(batch, ordered=False)
+        try:
+            recipes_coll.bulk_write(batch, ordered=False)
+        except:
+            pass
     
     elapsed = time.time() - start
-    print(f"\n   ✅ DONE! {count} recipes in {elapsed:.0f}s ({elapsed/60:.1f} min)")
+    final_count = recipes_coll.count_documents({})
+    print(f"\n   ✅ DONE! {final_count} recipes in {elapsed:.0f}s ({elapsed/60:.1f} min)")
     print(f"   ⚠️ Errors: {errors}")
 
 def main():
     print("="*60)
-    print("🔥 FINAL SCRAPER - NO DUPLICATES")
+    print("🔥 FINAL SCRAPER - NO DUPLICATES, NEW DB")
     print("="*60)
     
     overall_start = time.time()
     
-    # Step 0: Clean database
-    clean_db()
+    # Step 0: Setup database (NO DROP)
+    setup_db()
     
     # Step 1: Download data
     index, data_str = download_data()
