@@ -5,14 +5,23 @@ from pymongo import MongoClient, UpdateOne
 from dotenv import load_dotenv
 import os
 import time
+import sys
 
 load_dotenv()
 
-# ===== NEW MONGO CREDENTIALS =====
-MONGO_URI = "mongodb+srv://srishtidutt12_db_user:pCDhpXnv2bxhMs0r@cluster0.hcbkwxy.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+# ===== NEW MONGO CREDENTIALS (CONFIRMED WORKING) =====
+MONGO_URI = "mongodb+srv://srishtidutt12_db_user:ttqGhMQPDe88ZFif@cluster0.u3ktbp6.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 DB_NAME = "infinite_craft_bot"
 
-client = MongoClient(MONGO_URI)
+# Test connection pehle
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+    client.admin.command('ping')
+    print("✅ MongoDB connected!")
+except Exception as e:
+    print(f"❌ Connection failed: {e}")
+    sys.exit(1)
+
 db = client[DB_NAME]
 recipes_coll = db["website_recipes"]
 elements_coll = db["website_elements"]
@@ -20,31 +29,38 @@ elements_coll = db["website_elements"]
 DATA_URL = "https://github.com/expitau/InfiniteCraftWiki/raw/refs/heads/main/web/data/data.json"
 
 def setup_db():
-    """Pehle check karo ki collections exist karte hain ya nahi, agar nahi toh create karo"""
+    """Collections create karo agar exist nahi karte - safe way"""
     print("🔧 Setting up database...")
     
-    # Check if collections already exist
-    existing_collections = db.list_collection_names()
-    
-    if "website_elements" not in existing_collections:
-        # Create collection with indexes
+    # Direct createIndex - agar already exist karta hai toh error ignore
+    try:
         elements_coll.create_index([("name", 1)], unique=True)
-        elements_coll.create_index([("code", 1)], unique=True)
-        print("   ✅ Elements collection created with indexes")
-    else:
-        print("   ✅ Elements collection already exists")
+        print("   ✅ name index created/skipped")
+    except Exception as e:
+        print(f"   ⚠️ name index: {e}")
     
-    if "website_recipes" not in existing_collections:
+    try:
+        elements_coll.create_index([("code", 1)], unique=True)
+        print("   ✅ code index created/skipped")
+    except Exception as e:
+        print(f"   ⚠️ code index: {e}")
+    
+    try:
         recipes_coll.create_index([("first", 1), ("second", 1)])
+        print("   ✅ first+second index created/skipped")
+    except Exception as e:
+        print(f"   ⚠️ first+second index: {e}")
+    
+    try:
         recipes_coll.create_index([("result", 1)])
-        print("   ✅ Recipes collection created with indexes")
-    else:
-        print("   ✅ Recipes collection already exists")
+        print("   ✅ result index created/skipped")
+    except Exception as e:
+        print(f"   ⚠️ result index: {e}")
 
 def download_data():
     """Download data.json"""
-    print("📥 Downloading data.json...")
-    resp = requests.get(DATA_URL, timeout=300)
+    print("📥 Downloading data.json (94 MB)...")
+    resp = requests.get(DATA_URL, timeout=600)
     if resp.status_code != 200:
         print(f"❌ Failed: {resp.status_code}")
         return None, None
@@ -63,6 +79,7 @@ def insert_elements(index):
     
     batch = []
     count = 0
+    errors = 0
     
     for code, elem in index.items():
         emoji = elem[0]
@@ -85,13 +102,16 @@ def insert_elements(index):
         
         if len(batch) >= 10000:
             try:
-                elements_coll.bulk_write(batch, ordered=False)
-            except:
+                result = elements_coll.bulk_write(batch, ordered=False)
+                errors += result.upserted_count - len(batch) if result.upserted_count else 0
+            except Exception as e:
+                errors += 1
+                # Ek-ek karke try karo
                 for op in batch:
                     try:
                         elements_coll.bulk_write([op], ordered=False)
                     except:
-                        pass
+                        errors += 1
             batch = []
             print(f"   ✅ {count} elements...")
     
@@ -106,7 +126,7 @@ def insert_elements(index):
                     pass
     
     final_count = elements_coll.count_documents({})
-    print(f"   ✅ Total: {final_count} elements")
+    print(f"   ✅ Total: {final_count} elements (errors: {errors})")
 
 def insert_recipes(index, data_str):
     """Bulk insert recipes - FAST"""
@@ -157,8 +177,9 @@ def insert_recipes(index, data_str):
         if len(batch) >= 10000:
             try:
                 recipes_coll.bulk_write(batch, ordered=False)
-            except:
-                pass
+            except Exception as e:
+                errors += 1
+                print(f"   ⚠️ batch error: {e}")
             batch = []
             
             elapsed = time.time() - start
@@ -171,8 +192,8 @@ def insert_recipes(index, data_str):
     if batch:
         try:
             recipes_coll.bulk_write(batch, ordered=False)
-        except:
-            pass
+        except Exception as e:
+            print(f"   ⚠️ last batch error: {e}")
     
     elapsed = time.time() - start
     final_count = recipes_coll.count_documents({})
@@ -181,23 +202,23 @@ def insert_recipes(index, data_str):
 
 def main():
     print("="*60)
-    print("🔥 FINAL SCRAPER - NO DUPLICATES, NEW DB")
+    print("🔥 FINAL SCRAPER - FRESH DB")
     print("="*60)
     
     overall_start = time.time()
     
-    # Step 0: Setup database (NO DROP)
+    # Setup
     setup_db()
     
-    # Step 1: Download data
+    # Download
     index, data_str = download_data()
     if not index:
         return
     
-    # Step 2: Insert elements
+    # Insert elements
     insert_elements(index)
     
-    # Step 3: Insert recipes
+    # Insert recipes
     insert_recipes(index, data_str)
     
     # Summary
